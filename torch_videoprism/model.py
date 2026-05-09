@@ -535,10 +535,12 @@ class FactorizedVideoEncoder(nn.Module):
         pooled = self.contrastive_vision_pooler(feats)  # (B, Q=1, D)
         out = pooled.squeeze(-2)                    # (B, D)
         if normalize:
-            # Match `_l2_normalize` in JAX: norm computed in fp32 for stability.
+            # Match `encoders._l2_normalize`: cast to fp32, compute
+            # `sqrt(sum(x*x) + eps)` (eps INSIDE the sqrt), divide.
             orig_dtype = out.dtype
             out_f = out.float()
-            out = (out_f / (out_f.norm(dim=-1, keepdim=True) + 1e-12)).to(orig_dtype)
+            norm = torch.sqrt((out_f * out_f).sum(dim=-1, keepdim=True) + 1e-12)
+            out = (out_f / norm).to(orig_dtype)
         return out
 
 

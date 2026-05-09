@@ -26,7 +26,7 @@ import torch
 from torch_videoprism.model import (
     FactorizedEncoder,
     FactorizedVideoEncoder,
-    build_videoprism_v1_base,
+    build_videoprism,
 )
 
 
@@ -259,7 +259,6 @@ def _pooler_state_dict(
     return sd
 
 
-# Public alias for the v1 (non-LvT) state-dict builder; kept for backwards-compat.
 def flax_params_to_state_dict(
     flax_params: Mapping[str, np.ndarray], num_spatial_layers: int, num_temporal_layers: int
 ) -> dict[str, torch.Tensor]:
@@ -323,7 +322,10 @@ def load_pretrained_weights(
       The model (same instance as the `model` arg if provided).
     """
     if model is None:
-        model = build_videoprism_v1_base()
+        # Build the *right* model for `model_name`. Previously this always
+        # returned a v1_base, which then errored at load_state_dict whenever
+        # the user asked for a non-base variant.
+        model = build_videoprism(model_name)
 
     if checkpoint_path is None:
         checkpoint_path = _hf_download(model_name)
