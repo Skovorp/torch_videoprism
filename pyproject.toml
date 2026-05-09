@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torch_videoprism"
+version = "0.1.0"
+description = "PyTorch port of Google DeepMind's VideoPrism (JAX/Flax) factorized video encoder."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Skovorp" },
+]
+keywords = ["video", "transformer", "vivit", "videoprism", "pytorch"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.4",
+    "numpy>=1.26",
+    "huggingface_hub>=0.20",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+]
+# Pulls in the JAX side too — needed only to regenerate the parity fixtures from
+# `tests/extract_fixture_jax.py`. Keep separate so users running just the PyTorch
+# port don't need a JAX install.
+parity = [
+    "jax",
+    "flax",
+    "einops",
+    "einshape",
+    "videoprism @ git+https://github.com/google-deepmind/videoprism",
+    "tensorflow-cpu",
+    "decord",
+    "opencv-python",
+]
+
+[project.urls]
+Homepage = "https://github.com/Skovorp/torch_videoprism"
+Issues = "https://github.com/Skovorp/torch_videoprism/issues"
+Original = "https://github.com/google-deepmind/videoprism"
+Paper = "https://arxiv.org/abs/2402.13217"
+
+[tool.setuptools.packages.find]
+include = ["torch_videoprism*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
