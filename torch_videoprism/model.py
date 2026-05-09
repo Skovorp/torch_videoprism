@@ -44,7 +44,7 @@ from torch.nn import functional as F
 
 VIDEOPRISM_V1_BASE_CONFIG = dict(
     patch_size=18,
-    pos_emb_shape=(16, 16, 16),  # (T, H_p, W_p)
+    pos_emb_shape=(16, 16, 16),  # (T, H_p, W_p) — 16 frames, 16x16 spatial patches
     model_dim=768,
     num_spatial_layers=12,
     num_temporal_layers=4,
@@ -52,6 +52,22 @@ VIDEOPRISM_V1_BASE_CONFIG = dict(
     mlp_dim=3072,
     atten_logit_cap=50.0,
 )
+
+VIDEOPRISM_V1_LARGE_CONFIG = dict(
+    patch_size=18,
+    pos_emb_shape=(8, 16, 16),   # (T, H_p, W_p) — 8 frames @ 288px (vs 16 in base)
+    model_dim=1024,
+    num_spatial_layers=24,
+    num_temporal_layers=4,
+    num_heads=16,
+    mlp_dim=4096,
+    atten_logit_cap=50.0,
+)
+
+CONFIGS = {
+    "videoprism_public_v1_base": VIDEOPRISM_V1_BASE_CONFIG,
+    "videoprism_public_v1_large": VIDEOPRISM_V1_LARGE_CONFIG,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -337,3 +353,20 @@ class FactorizedEncoder(nn.Module):
 def build_videoprism_v1_base() -> FactorizedEncoder:
     """Builds a fresh FactorizedEncoder with the v1 base config (random init)."""
     return FactorizedEncoder(**VIDEOPRISM_V1_BASE_CONFIG)
+
+
+def build_videoprism_v1_large() -> FactorizedEncoder:
+    """Builds a fresh FactorizedEncoder with the v1 large config (random init)."""
+    return FactorizedEncoder(**VIDEOPRISM_V1_LARGE_CONFIG)
+
+
+def build_videoprism(model_name: str) -> FactorizedEncoder:
+    """Generic factory: build a FactorizedEncoder by VideoPrism model name.
+
+    Args:
+      model_name: one of `CONFIGS` (e.g. 'videoprism_public_v1_base',
+        'videoprism_public_v1_large').
+    """
+    if model_name not in CONFIGS:
+        raise ValueError(f"unknown VideoPrism model {model_name!r}. Known: {sorted(CONFIGS)}")
+    return FactorizedEncoder(**CONFIGS[model_name])

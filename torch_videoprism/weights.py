@@ -43,22 +43,28 @@ def _load_npz_flat(path: str) -> dict[str, np.ndarray]:
     return out
 
 
+# Mapping from VideoPrism model name to its (HF repo_id, npz filename).
+# Mirrors `videoprism.models.CHECKPOINTS` upstream.
+HF_CHECKPOINTS: dict[str, tuple[str, str]] = {
+    "videoprism_public_v1_base": (
+        "google/videoprism-base-f16r288",
+        "flax_base_f16r288_repeated.npz",
+    ),
+    "videoprism_public_v1_large": (
+        "google/videoprism-large-f8r288",
+        "flax_large_f8r288_repeated.npz",
+    ),
+}
+
+
 def _hf_download(model_name: str) -> str:
     """Downloads the VideoPrism Flax .npz from Hugging Face and returns the local path."""
-    # Same mapping as videoprism.models.CHECKPOINTS, but local so we don't
-    # require the JAX-side package to be importable.
-    checkpoints = {
-        "videoprism_public_v1_base": (
-            "google/videoprism-base-f16r288",
-            "flax_base_f16r288_repeated.npz",
-        ),
-    }
-    if model_name not in checkpoints:
+    if model_name not in HF_CHECKPOINTS:
         raise ValueError(
             f"Unknown VideoPrism checkpoint name: {model_name!r}. "
-            f"Known: {sorted(checkpoints)}"
+            f"Known: {sorted(HF_CHECKPOINTS)}"
         )
-    repo_id, filename = checkpoints[model_name]
+    repo_id, filename = HF_CHECKPOINTS[model_name]
     from huggingface_hub import hf_hub_download
 
     return hf_hub_download(repo_id=repo_id, filename=filename)
