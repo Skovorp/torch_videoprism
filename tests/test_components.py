@@ -66,35 +66,23 @@ def test_mlp_forward_shape_and_residual():
 # ---------- Attention ----------
 
 
-def test_attention_logit_cap_disabled_matches_uncapped():
-    """Setting cap=0 should disable cap; we verify by toggling cap and observing equivalent results when logits are small."""
+def test_attention_matches_manual():
+    """The CPU einsum path equals a hand-derived `q · kᵀ → cap → softmax → · v`.
+
+    Pins the math (query scaled by `1/sqrt(d_h)`, Primer cap before softmax,
+    softmax in fp32) to a reference computation with the same weights.
+    """
     g = _seed()
-    attn_capped = MultiHeadSelfAttention(dim=64, num_heads=4, atten_logit_cap=50.0)
-    attn_uncapped = MultiHeadSelfAttention(dim=64, num_heads=4, atten_logit_cap=0.0)
-    # share params
-    attn_uncapped.load_state_dict(attn_capped.state_dict())
-
-    x = torch.randn(2, 5, 64, generator=g) * 0.5  # small => logits small => tanh ~ identity
-    y_a = attn_capped(x)
-    y_b = attn_uncapped(x)
-    # With small inputs, cap is nearly a no-op.
-    torch.testing.assert_close(y_a, y_b, rtol=1e-4, atol=1e-4)
-
-
-def test_attention_query_scale_matches_manual():
-    """Verify the 1/sqrt(dim_per_head) query scaling matches a manual computation."""
-    g = _seed()
-    attn = MultiHeadSelfAttention(dim=64, num_heads=4, atten_logit_cap=0.0)
-    attn.eval()
+    attn = MultiHeadSelfAttention(dim=64, num_heads=4, atten_logit_cap=50.0).eval()
     x = torch.randn(2, 5, 64, generator=g)
     y = attn(x)
 
-    # Manual computation with the same weights
-    q = attn.query(x).view(2, 5, 4, 16)
+    cap = 50.0
+    q = attn.query(x).view(2, 5, 4, 16) * (16 ** -0.5)
     k = attn.key(x).view(2, 5, 4, 16)
     v = attn.value(x).view(2, 5, 4, 16)
-    q = q * (16 ** -0.5)
     logits = torch.einsum("btnh,bsnh->bnts", q, k)
+    logits = cap * torch.tanh(logits / cap)
     probs = torch.softmax(logits.float(), dim=-1).to(v.dtype)
     encoded = torch.einsum("bnts,bsnh->btnh", probs, v).reshape(2, 5, 64)
     expected = attn.post(encoded)

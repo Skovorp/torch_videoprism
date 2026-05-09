@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.4",
+    "torch>=2.5",   # FlexAttention is used in the self-attention path; introduced in 2.5.
     "numpy>=1.26",
     "huggingface_hub>=0.20",
 ]

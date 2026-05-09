@@ -128,6 +128,27 @@ def _resize_frame(frame: np.ndarray, size: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+def _coerce_to_batch(videos: Any) -> list:
+    """Wrap `videos` into a list of single-clip items.
+
+    A "clip" is one of: a video file path, a 4D numpy/torch tensor `(T, H, W, 3)`,
+    or a list of frames (PIL or 3D arrays). A 5D numpy/torch `(B, T, H, W, 3)` is
+    a batch and gets unstacked. A list whose elements are themselves clips is
+    already a batch.
+    """
+    if isinstance(videos, str):
+        return [videos]
+    if isinstance(videos, (np.ndarray, torch.Tensor)) and videos.ndim == 5:
+        return list(videos)
+    if isinstance(videos, (list, tuple)) and videos:
+        first = videos[0]
+        if isinstance(first, str):
+            return list(videos)
+        if isinstance(first, (np.ndarray, torch.Tensor)) and first.ndim == 4:
+            return list(videos)
+    return [videos]
+
+
 class VideoPrismVideoProcessor(BaseImageProcessor):
     """Preprocessor for VideoPrism. See module docstring for the convention.
 
@@ -188,21 +209,7 @@ class VideoPrismVideoProcessor(BaseImageProcessor):
         do_rescale = self.do_rescale if do_rescale is None else do_rescale
         rescale_factor = self.rescale_factor if rescale_factor is None else rescale_factor
 
-        # Decide whether `videos` is a single clip or a batch of clips.
-        if isinstance(videos, str):
-            batch = [videos]
-        elif isinstance(videos, np.ndarray) and videos.ndim == 5:
-            batch = [videos[i] for i in range(videos.shape[0])]
-        elif isinstance(videos, torch.Tensor) and videos.ndim == 5:
-            batch = [videos[i] for i in range(videos.shape[0])]
-        elif isinstance(videos, (list, tuple)) and videos and isinstance(
-            videos[0], (np.ndarray, torch.Tensor, str)
-        ) and (not isinstance(videos[0], (np.ndarray, torch.Tensor)) or videos[0].ndim == 4):
-            # List of (T, H, W, 3) clips, list of paths, or list of (T, H, W, 3) tensors.
-            batch = list(videos)
-        else:
-            # Treat as a single clip (np array, torch tensor, list of frames, PIL list).
-            batch = [videos]
+        batch = _coerce_to_batch(videos)
 
         processed = np.stack(
             [self._preprocess_one(v, do_rescale=do_rescale, rescale_factor=rescale_factor)

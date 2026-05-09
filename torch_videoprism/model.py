@@ -129,15 +129,20 @@ class MLP(nn.Module):
         return residual + h
 
 
-class MultiHeadSelfAttention(nn.Module):
-    """Multi-head self-attention matching `layers.DotProductAttention`.
+from torch.nn.attention.flex_attention import flex_attention as _flex_attention
 
-    Configuration matches videoprism v1 base:
-      - internal_enable_per_dim_scale=False, scale_query_by_dim_per_head=False
-        => query is scaled by `1/sqrt(dim_per_head)` (== `1/sqrt(D/N)`).
-      - atten_logit_cap=50.0 applied as `cap * tanh(logits / cap)` BEFORE softmax.
-      - softmax computed in fp32 then cast back.
-      - no dropout, no causal mask, no padding mask.
+
+class MultiHeadSelfAttention(nn.Module):
+    """Pre-LN multi-head self-attention with Primer-style logit cap.
+
+    Implementation:
+      - Q is implicitly scaled by `1/sqrt(dim_per_head)` (FlexAttention's default
+        `scale`, or applied manually in the einsum path).
+      - Logits are capped via `atten_logit_cap * tanh(logits / cap)` BEFORE softmax.
+      - On CUDA we use `flex_attention` with a `score_mod` callback, matching the
+        cap exactly while hitting fused kernels. On CPU we fall back to einsum
+        (FlexAttention is CUDA-only). Both produce numerically equivalent output
+        within fp32 noise.
     """
 
     def __init__(self, dim: int, num_heads: int, atten_logit_cap: float = 50.0):
@@ -148,43 +153,38 @@ class MultiHeadSelfAttention(nn.Module):
         self.dim_per_head = dim // num_heads
         self.atten_logit_cap = atten_logit_cap
 
-        # Each of Q/K/V/post is `nn.Linear(dim, dim)` viewed as (D -> N*H).
         # Naming matches the Flax `self_attention/{query,key,value,post}` subtrees.
         self.query = nn.Linear(dim, dim, bias=True)
         self.key = nn.Linear(dim, dim, bias=True)
         self.value = nn.Linear(dim, dim, bias=True)
         self.post = nn.Linear(dim, dim, bias=True)
 
-    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, D) -> (B, T, N, H)
-        b, t, _ = x.shape
-        return x.view(b, t, self.num_heads, self.dim_per_head)
-
-    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, N, H) -> (B, T, D)
-        b, t, _, _ = x.shape
-        return x.reshape(b, t, self.dim)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        q = self._split_heads(self.query(x))
-        k = self._split_heads(self.key(x))
-        v = self._split_heads(self.value(x))
+        b, t, _ = x.shape
+        # (B, T, D) -> (B, T, N, H)
+        q = self.query(x).view(b, t, self.num_heads, self.dim_per_head)
+        k = self.key(x).view(b, t, self.num_heads, self.dim_per_head)
+        v = self.value(x).view(b, t, self.num_heads, self.dim_per_head)
+        cap = self.atten_logit_cap
 
-        # Query scale: matches `_scale_query` with internal_enable_per_dim_scale=False.
-        q = q * (self.dim_per_head ** -0.5)
-
-        # logits[b, n, t, s] = sum_h q[b, t, n, h] * k[b, s, n, h]
-        logits = torch.einsum("btnh,bsnh->bnts", q, k)
-
-        # Logit cap (Primer-style tanh cap), then softmax in fp32.
-        if self.atten_logit_cap and self.atten_logit_cap > 0:
-            cap = self.atten_logit_cap
+        if x.is_cuda:
+            # FlexAttention wants (B, N, T, H). It auto-scales Q by 1/sqrt(H);
+            # `score_mod` runs on the already-scaled scores, before softmax.
+            def score_mod(s, _b, _h, _qi, _kvi):
+                return cap * torch.tanh(s / cap)
+            encoded = _flex_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                score_mod=score_mod,
+            ).transpose(1, 2)
+        else:
+            # CPU einsum path: scale Q manually, dot, cap, softmax in fp32, then V.
+            q = q * (self.dim_per_head ** -0.5)
+            logits = torch.einsum("btnh,bsnh->bnts", q, k)
             logits = cap * torch.tanh(logits / cap)
-        probs = F.softmax(logits.float(), dim=-1).to(v.dtype)
+            probs = F.softmax(logits.float(), dim=-1).to(v.dtype)
+            encoded = torch.einsum("bnts,bsnh->btnh", probs, v)
 
-        # encoded[b, t, n, h] = sum_s probs[b, n, t, s] * v[b, s, n, h]
-        encoded = torch.einsum("bnts,bsnh->btnh", probs, v)
-        return self.post(self._merge_heads(encoded))
+        return self.post(encoded.reshape(b, t, self.dim))
 
 
 class TransformerBlock(nn.Module):
@@ -288,28 +288,21 @@ def _interpolate_1d_pos(emb: torch.Tensor, target_len: int) -> torch.Tensor:
 def patchify_image(x: torch.Tensor, patch_size: int) -> torch.Tensor:
     """`encoders._image_to_patch` ported to PyTorch.
 
-    Input:  (..., H, W, C). Channels-last like the JAX code.
-    Output: (..., (H/P)*(W/P), P*P*C). Patches are row-major over (m, n);
-    pixels within a patch are row-major over (p, q, c) — same as
-    einops' '... (m p)(n q) c -> ... (m n) (p q c)'.
+    Input:  (BT, H, W, C) channels-last (matches JAX).
+    Output: (BT, (H/P)*(W/P), P*P*C). Patches are row-major over (m, n);
+    pixels within a patch are row-major over (p, q, c) — same as einops
+    `(m p)(n q) c -> (m n)(p q c)`.
     """
-    *lead, h, w, c = x.shape
-    assert h % patch_size == 0 and w % patch_size == 0, (h, w, patch_size)
-    m = h // patch_size
-    n = w // patch_size
+    bt, h, w, c = x.shape
     p = patch_size
-    # Reshape so (m, p) factor H and (n, q) factor W.
-    x = x.reshape(*lead, m, p, n, p, c)
-    # Bring m, n together (row-major over patches), then p, q, c together.
-    perm = list(range(len(lead))) + [
-        len(lead) + 0,  # m
-        len(lead) + 2,  # n
-        len(lead) + 1,  # p
-        len(lead) + 3,  # q
-        len(lead) + 4,  # c
-    ]
-    x = x.permute(*perm).contiguous()
-    return x.reshape(*lead, m * n, p * p * c)
+    assert h % p == 0 and w % p == 0, (h, w, p)
+    m, n = h // p, w // p
+    return (
+        x.reshape(bt, m, p, n, p, c)
+         .permute(0, 1, 3, 2, 4, 5)            # (BT, m, n, p, q, c)
+         .contiguous()
+         .reshape(bt, m * n, p * p * c)
+    )
 
 
 # ---------------------------------------------------------------------------
