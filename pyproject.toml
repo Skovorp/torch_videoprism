@@ -30,6 +30,11 @@ dependencies = [
 test = [
     "pytest>=8",
 ]
+# Needed for the HF wrappers in `torch_videoprism.hf` and the build-repo helper.
+hf = [
+    "transformers>=4.40",
+    "safetensors>=0.4",
+]
 # Pulls in the JAX side too — needed only to regenerate the parity fixtures from
 # `tests/extract_fixture_jax.py`. Keep separate so users running just the PyTorch
 # port don't need a JAX install.
