@@ -31,9 +31,14 @@ test = [
     "pytest>=8",
 ]
 # Needed for the HF wrappers in `torch_videoprism.hf` and the build-repo helper.
+# `decord` + `opencv-python` make the processor's video-file-path and resize
+# code paths work out of the box; both are wrapped in try/except so missing
+# them only errors when those code paths are actually hit.
 hf = [
     "transformers>=4.40",
     "safetensors>=0.4",
+    "decord>=0.6",
+    "opencv-python>=4.5",
 ]
 # Pulls in the JAX side too — needed only to regenerate the parity fixtures from
 # `tests/extract_fixture_jax.py`. Keep separate so users running just the PyTorch

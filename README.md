@@ -26,6 +26,42 @@ pip install git+https://github.com/Skovorp/torch_videoprism
 
 ## Quick start
 
+Three loading paths — pick whichever you prefer.
+
+**HuggingFace `AutoModel`** (recommended — one line, handles preprocessing too):
+
+```python
+import torch
+from transformers import AutoModel, AutoProcessor
+
+model = AutoModel.from_pretrained("Skovorp/videoprism-base-f16r288-pt", trust_remote_code=True).eval()
+processor = AutoProcessor.from_pretrained("Skovorp/videoprism-base-f16r288-pt", trust_remote_code=True)
+
+# Accepts: a video file path, a list of PIL Images, np.array (T, H, W, 3) of uint8 or float,
+# or a torch.Tensor of one of those shapes. Frames are sampled uniformly to the model's
+# native frame count and resized to 288x288. Pixels assumed in [0, 255]; pass do_rescale=False
+# if your input is already in [0, 1].
+inputs = processor(videos="my_clip.mp4", return_tensors="pt")
+with torch.no_grad():
+    out = model(**inputs)
+embedding = out.last_hidden_state          # (1, 4096, 768) for base
+# For LvT variants, the attribute is `out.video_embeds` and the shape is (B, model_dim).
+```
+
+Available HF repos: `videoprism-base-f16r288-pt`, `videoprism-large-f8r288-pt`, `videoprism-lvt-base-f16r288-pt`, `videoprism-lvt-large-f8r288-pt`.
+
+**`torch.hub.load`** (no `pip install` required):
+
+```python
+encoder = torch.hub.load(
+    "Skovorp/torch_videoprism", "videoprism_v1_base",
+    pretrained=True, trust_repo=True,
+)
+# Other entry points: videoprism_v1_large, videoprism_lvt_v1_base, videoprism_lvt_v1_large.
+```
+
+**Direct package import** (most control, no HF dependency):
+
 ```python
 import torch
 from torch_videoprism import build_videoprism, load_pretrained_weights
@@ -40,16 +76,6 @@ model.eval()
 video = torch.rand(1, 16, 288, 288, 3)
 with torch.no_grad():
     out = model(video)                # (1, 4096, 768) for base; (1, 768) for lvt-base
-```
-
-Or via `torch.hub`, no package install required:
-
-```python
-encoder = torch.hub.load(
-    "Skovorp/torch_videoprism", "videoprism_v1_base",
-    pretrained=True, trust_repo=True,
-)
-# Other entry points: videoprism_v1_large, videoprism_lvt_v1_base, videoprism_lvt_v1_large.
 ```
 
 ## Architecture
@@ -120,16 +146,34 @@ CPU vs GPU, `B=1, T=native, 288²`, mean of 5–10 timed iterations after warmup
 
 ## Regenerating the parity fixtures
 
-The fixtures used by the tests aren't shipped (~250 MB total). To regenerate from the JAX reference:
+The parity fixtures aren't shipped in-repo (~250 MB total). Without them, only the 9 unit tests in `tests/test_components.py` run; the 17 parity tests are skipped silently. To regenerate from the JAX reference:
 
 ```bash
-pip install ".[parity]"      # installs jax, flax, the upstream videoprism package
+pip install ".[parity]"      # installs jax, flax, the upstream videoprism package, decord, opencv
+
+# Generate one fixture per variant (single-clip pair of seeds + intermediates for v1_base).
 python tests/extract_fixture_jax.py --out tests/fixtures/v1_base.npz       --model videoprism_public_v1_base       --seeds 0,1 --save-intermediates
 python tests/extract_fixture_jax.py --out tests/fixtures/v1_large.npz      --model videoprism_public_v1_large      --seeds 0,1
 python tests/extract_fixture_jax.py --out tests/fixtures/lvt_v1_base.npz   --model videoprism_lvt_public_v1_base   --seeds 0,1
 python tests/extract_fixture_jax.py --out tests/fixtures/lvt_v1_large.npz  --model videoprism_lvt_public_v1_large  --seeds 0,1
+
+# `tests/test_deep_parity.py` needs a separate 3-batch fixture for v1_base.
+python tests/extract_fixture_jax.py --out tests/fixtures/v1_base_multi.npz --model videoprism_public_v1_base       --seeds 0,1,2 --save-intermediates
+
 pytest tests/
 ```
+
+Each test fixture path can be overridden via env var (defaults are
+`tests/fixtures/<name>.npz`):
+
+| Env var | Used by | Default |
+|---|---|---|
+| `VIDEOPRISM_FIXTURE_BASE`       | `test_e2e_parity.py` (v1 base)         | `tests/fixtures/v1_base.npz`       |
+| `VIDEOPRISM_FIXTURE_LARGE`      | `test_e2e_parity.py` (v1 large)        | `tests/fixtures/v1_large.npz`      |
+| `VIDEOPRISM_FIXTURE_LVT_BASE`   | `test_e2e_parity.py` (lvt base)        | `tests/fixtures/lvt_v1_base.npz`   |
+| `VIDEOPRISM_FIXTURE_LVT_LARGE`  | `test_e2e_parity.py` (lvt large)       | `tests/fixtures/lvt_v1_large.npz`  |
+| `VIDEOPRISM_MULTI_FIXTURE`      | `test_deep_parity.py`                  | `tests/fixtures/v1_base_multi.npz` |
+| `VIDEOPRISM_NPZ_<VARIANT>`      | optional override of the Flax `.npz` checkpoint path (otherwise pulled from HF) |
 
 ## Layout
 
@@ -137,7 +181,12 @@ pytest tests/
 torch_videoprism/
 ├── __init__.py                 # public API
 ├── model.py                    # FactorizedEncoder, FactorizedVideoEncoder, building blocks
-└── weights.py                  # Flax (.npz) -> PyTorch state_dict converter
+├── weights.py                  # Flax (.npz) -> PyTorch state_dict converter
+└── hf/                         # HuggingFace integration (`pip install '.[hf]'`)
+    ├── configuration_videoprism.py
+    ├── modeling_videoprism.py  # PreTrainedModel wrappers
+    ├── processing_videoprism.py # ImageProcessor
+    └── build_repo.py           # produces self-contained trust_remote_code repo dirs
 tests/
 ├── test_components.py          # unit tests (no checkpoint, no JAX)
 ├── test_e2e_parity.py          # final-output parity, all 4 variants
@@ -145,7 +194,7 @@ tests/
 ├── extract_fixture_jax.py      # regenerates JAX fixtures
 └── bench_inference.py          # JAX vs PyTorch (eager + compile) timings
 hubconf.py                      # torch.hub entry points
-pyproject.toml
+pyproject.toml                  # extras: [test], [hf], [parity]
 LICENSE                         # Apache-2.0
 ```
 

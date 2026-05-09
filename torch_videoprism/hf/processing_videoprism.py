@@ -1,15 +1,24 @@
-"""HuggingFace `BaseImageProcessor` for VideoPrism.
+"""HuggingFace processor for VideoPrism inputs.
 
-Handles the video → tensor conversion expected by `VideoPrismModel` and
-`VideoPrismLvtModel`:
+Follows the standard `BaseImageProcessor` convention:
 
-  - Accepts: a video file path, a list of PIL Images, a numpy array of shape
-    (T, H, W, C) or (B, T, H, W, C) (uint8 or float), or a torch.Tensor.
-  - Produces: `pixel_values` torch.Tensor of shape (B, T, H, W, C), float32 in [0, 1].
+  - Input pixels are assumed to be in **[0, 255]** by default; `do_rescale=True`
+    multiplies by `rescale_factor=1/255` to put them in [0, 1] before the model.
+  - If your frames are already in [0, 1], pass `do_rescale=False`.
 
-Frame sampling: linear (uniform) sampling of `num_frames` indices over the
-input clip. For lists of frames whose length already matches `num_frames`,
-no sampling is done.
+Accepts videos as: a path to a video file, a list of PIL images, a numpy array
+of shape `(T, H, W, 3)` or `(B, T, H, W, 3)`, or a torch.Tensor with one of
+those shapes. Returns a `BatchFeature` with `pixel_values` of shape
+`(B, T, image_size, image_size, 3)`, `float32`, in `[0, 1]` by default.
+
+Example:
+    >>> proc = VideoPrismVideoProcessor()                  # image_size=288, num_frames=16
+    >>> inputs = proc(videos="my_clip.mp4", return_tensors="pt")
+    >>> inputs["pixel_values"].shape, inputs["pixel_values"].dtype
+    (torch.Size([1, 16, 288, 288, 3]), torch.float32)
+
+    # Already-decoded frames in [0, 1]:
+    >>> proc(videos=frames01, do_rescale=False, return_tensors="pt")
 """
 from __future__ import annotations
 
@@ -21,16 +30,24 @@ import torch
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
 
-def _ensure_uint8_array(frames: Any) -> np.ndarray:
-    """Coerce a single video to a uint8 numpy array of shape (T, H, W, 3)."""
+# ---------------------------------------------------------------------------
+# Helpers — all "heavy" decoder/resizer imports are wrapped in try/except so
+# `transformers.dynamic_module_utils.check_imports` doesn't reject this file
+# when running with a minimal environment (and so users who feed in already-
+# preprocessed frames don't need decord/cv2/PIL installed).
+# ---------------------------------------------------------------------------
+
+
+def _to_array(frames: Any) -> np.ndarray:
+    """Coerce any single video to a numpy array of shape (T, H, W, 3).
+
+    Preserves the input dtype — `do_rescale` decides whether/how to rescale.
+    """
     if isinstance(frames, np.ndarray):
         arr = frames
     elif isinstance(frames, torch.Tensor):
         arr = frames.detach().cpu().numpy()
     elif isinstance(frames, (list, tuple)):
-        # List of PIL.Images or np arrays. Import PIL lazily — wrapping in
-        # try/except also keeps `transformers.dynamic_module_utils.check_imports`
-        # from rejecting the file when PIL isn't installed.
         try:
             from PIL import Image  # type: ignore
             is_pil = bool(frames) and isinstance(frames[0], Image.Image)
@@ -45,30 +62,20 @@ def _ensure_uint8_array(frames: Any) -> np.ndarray:
 
     if arr.ndim != 4 or arr.shape[-1] != 3:
         raise ValueError(
-            f"Expected video as (T, H, W, 3); got shape {arr.shape}"
+            f"Expected a single video shaped (T, H, W, 3); got {arr.shape}. "
+            f"For batched input pass a list of videos or a (B, T, H, W, 3) tensor."
         )
-    if arr.dtype != np.uint8:
-        # Float in [0, 1] also accepted, convert.
-        if arr.dtype.kind == "f":
-            arr = (np.clip(arr, 0.0, 1.0) * 255.0).round().astype(np.uint8)
-        else:
-            arr = arr.astype(np.uint8)
     return arr
 
 
 def _decode_video(path: str, num_frames: int) -> np.ndarray:
-    """Decode a video file to (num_frames, H, W, 3) uint8.
-
-    Imports `decord` lazily — wrapped in try/except so users who only feed in
-    pre-decoded frame arrays don't need decord installed (and HF's dynamic
-    module loader doesn't flag it as a hard dep).
-    """
+    """Decode a video file to (num_frames, H, W, 3) uint8 frames."""
     try:
         from decord import VideoReader, cpu  # type: ignore
     except ImportError as e:
         raise ImportError(
-            "Decoding video files needs `decord`. Install it (`pip install decord`) "
-            "or pass already-decoded frames (np.array of shape (T, H, W, 3))."
+            "Decoding video files needs `decord`. "
+            "Install it (`pip install decord`) or pass already-decoded frames."
         ) from e
 
     vr = VideoReader(path, ctx=cpu(0))
@@ -89,12 +96,12 @@ def _sample_uniform(arr: np.ndarray, num_frames: int) -> np.ndarray:
 
 
 def _resize_frame(frame: np.ndarray, size: int) -> np.ndarray:
-    """Resize a single (H, W, 3) uint8 frame to (size, size, 3) bilinearly.
+    """Bilinear resize one (H, W, 3) frame to (size, size, 3). Preserves dtype.
 
-    Tries `cv2` first, falls back to PIL. Either is fine — both produce a
-    bilinear resize. Wrapped in try/except so HF's dynamic loader doesn't
-    require either as a hard dep.
+    Tries cv2 first, falls back to PIL. Both wrapped so neither is a hard dep.
     """
+    if frame.shape[0] == size and frame.shape[1] == size:
+        return frame
     try:
         import cv2  # type: ignore
         return cv2.resize(frame, (size, size), interpolation=cv2.INTER_LINEAR)
@@ -102,26 +109,35 @@ def _resize_frame(frame: np.ndarray, size: int) -> np.ndarray:
         pass
     try:
         from PIL import Image  # type: ignore
-        return np.asarray(
-            Image.fromarray(frame).resize((size, size), Image.BILINEAR)
-        )
+        # PIL needs uint8; round-trip through float for any non-uint8 input.
+        if frame.dtype != np.uint8:
+            f = np.clip(frame, 0, 255).round().astype(np.uint8)
+        else:
+            f = frame
+        out = np.asarray(Image.fromarray(f).resize((size, size), Image.BILINEAR))
+        return out.astype(frame.dtype)
     except ImportError as e:
         raise ImportError(
             "Resizing frames needs either `opencv-python` or `pillow`. "
-            "Install one (`pip install opencv-python` or `pip install pillow`) "
-            "or pass frames already at the target spatial size."
+            "Install one or pass frames already at the target spatial size."
         ) from e
 
 
+# ---------------------------------------------------------------------------
+# Processor
+# ---------------------------------------------------------------------------
+
+
 class VideoPrismVideoProcessor(BaseImageProcessor):
-    """Preprocessor for VideoPrism inputs.
+    """Preprocessor for VideoPrism. See module docstring for the convention.
 
     Args:
-      image_size: target spatial size (frames are bilinearly resized to size×size).
-      num_frames: number of frames sampled uniformly per clip.
-      do_resize: if False, frames are not resized (must already be the right shape).
-      do_rescale: if False, frames are not divided by 255 (must already be in [0, 1]).
-      rescale_factor: divisor for uint8 → [0, 1] conversion (default 1/255).
+      image_size:    target spatial size — frames are bilinearly resized to size×size.
+      num_frames:    number of frames sampled uniformly from each clip.
+      do_resize:     if False, frames are not resized (must already match `image_size`).
+      do_rescale:    if True (default), multiplies pixels by `rescale_factor`. Set
+                     to False if your frames are already in [0, 1].
+      rescale_factor: multiplier applied when `do_rescale=True` (default `1/255`).
     """
     model_input_names = ["pixel_values"]
 
@@ -141,57 +157,66 @@ class VideoPrismVideoProcessor(BaseImageProcessor):
         self.do_rescale = do_rescale
         self.rescale_factor = rescale_factor
 
-    def _preprocess_one(self, video: Any) -> np.ndarray:
-        """Returns a (T, H, W, 3) float32 array in [0, 1]."""
+    def _preprocess_one(self, video: Any, *, do_rescale: bool, rescale_factor: float) -> np.ndarray:
+        """Return a (T, H, W, 3) float32 array, in [0, 1] when `do_rescale=True`."""
         if isinstance(video, str) and os.path.exists(video):
             arr = _decode_video(video, num_frames=self.num_frames)
         else:
-            arr = _ensure_uint8_array(video)
+            arr = _to_array(video)
             arr = _sample_uniform(arr, self.num_frames)
 
-        if self.do_resize and (arr.shape[1] != self.image_size or arr.shape[2] != self.image_size):
+        if self.do_resize:
             arr = np.stack([_resize_frame(f, self.image_size) for f in arr])
 
-        out = arr.astype(np.float32)
-        if self.do_rescale:
-            out = out * self.rescale_factor
+        out = arr.astype(np.float32, copy=False)
+        if do_rescale:
+            out = out * float(rescale_factor)
         return out
 
+    # `__call__` is not part of BaseImageProcessor's public API, but the standard
+    # HF `Auto*Processor` flow goes through it.
     def __call__(
         self,
         videos: Any = None,
         return_tensors: str | None = "pt",
+        do_rescale: bool | None = None,
+        rescale_factor: float | None = None,
         **_: Any,
     ) -> BatchFeature:
         if videos is None:
             raise ValueError("VideoPrismVideoProcessor requires a `videos` argument.")
+        do_rescale = self.do_rescale if do_rescale is None else do_rescale
+        rescale_factor = self.rescale_factor if rescale_factor is None else rescale_factor
 
-        # Wrap a single video into a batch.
-        is_batched = (
-            isinstance(videos, list)
-            and videos
-            and not isinstance(videos[0], (np.ndarray, torch.Tensor))
-            and not (
-                hasattr(videos[0], "__class__") and videos[0].__class__.__name__ == "Image"
-            )
-        ) or (isinstance(videos, np.ndarray) and videos.ndim == 5) or (
-            isinstance(videos, torch.Tensor) and videos.ndim == 5
-        )
-        # Special case: list-of-frames where each frame is np.array (T, H, W, 3) batched.
-        if isinstance(videos, list) and videos and isinstance(videos[0], np.ndarray) and videos[0].ndim == 4:
-            is_batched = True
+        # Decide whether `videos` is a single clip or a batch of clips.
+        if isinstance(videos, str):
+            batch = [videos]
+        elif isinstance(videos, np.ndarray) and videos.ndim == 5:
+            batch = [videos[i] for i in range(videos.shape[0])]
+        elif isinstance(videos, torch.Tensor) and videos.ndim == 5:
+            batch = [videos[i] for i in range(videos.shape[0])]
+        elif isinstance(videos, (list, tuple)) and videos and isinstance(
+            videos[0], (np.ndarray, torch.Tensor, str)
+        ) and (not isinstance(videos[0], (np.ndarray, torch.Tensor)) or videos[0].ndim == 4):
+            # List of (T, H, W, 3) clips, list of paths, or list of (T, H, W, 3) tensors.
+            batch = list(videos)
+        else:
+            # Treat as a single clip (np array, torch tensor, list of frames, PIL list).
+            batch = [videos]
 
-        if not is_batched:
-            videos = [videos]
-
-        processed = np.stack([self._preprocess_one(v) for v in videos])  # (B, T, H, W, 3)
+        processed = np.stack(
+            [self._preprocess_one(v, do_rescale=do_rescale, rescale_factor=rescale_factor)
+             for v in batch]
+        )  # (B, T, H, W, 3)
 
         if return_tensors == "pt":
             pixel_values = torch.from_numpy(processed)
         elif return_tensors is None:
             pixel_values = processed
         else:
-            raise ValueError(f"Only return_tensors='pt' or None is supported (got {return_tensors!r}).")
+            raise ValueError(
+                f"Only return_tensors='pt' or None is supported (got {return_tensors!r})."
+            )
 
         return BatchFeature(data={"pixel_values": pixel_values}, tensor_type=return_tensors)
 
