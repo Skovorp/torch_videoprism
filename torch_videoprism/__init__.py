@@ -5,22 +5,34 @@ Public weights: https://huggingface.co/google/videoprism-base-f16r288.
 """
 from torch_videoprism.model import (
     CONFIGS,
+    LVT_CONFIGS,
     FactorizedEncoder,
+    FactorizedVideoEncoder,
     VIDEOPRISM_V1_BASE_CONFIG,
     VIDEOPRISM_V1_LARGE_CONFIG,
+    VIDEOPRISM_LVT_V1_BASE_CONFIG,
+    VIDEOPRISM_LVT_V1_LARGE_CONFIG,
     build_videoprism,
     build_videoprism_v1_base,
     build_videoprism_v1_large,
+    build_videoprism_lvt_v1_base,
+    build_videoprism_lvt_v1_large,
 )
 from torch_videoprism.weights import load_pretrained_weights
 
 __all__ = [
     "CONFIGS",
+    "LVT_CONFIGS",
     "FactorizedEncoder",
+    "FactorizedVideoEncoder",
     "VIDEOPRISM_V1_BASE_CONFIG",
     "VIDEOPRISM_V1_LARGE_CONFIG",
+    "VIDEOPRISM_LVT_V1_BASE_CONFIG",
+    "VIDEOPRISM_LVT_V1_LARGE_CONFIG",
     "build_videoprism",
     "build_videoprism_v1_base",
     "build_videoprism_v1_large",
+    "build_videoprism_lvt_v1_base",
+    "build_videoprism_lvt_v1_large",
     "load_pretrained_weights",
 ]

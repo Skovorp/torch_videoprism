@@ -87,17 +87,31 @@ def main():
     state = vp.load_pretrained_weights(args.model)
     params = state["params"]
 
-    @jax.jit
-    def fwd(x):
-        return flax_model.apply(state, x, train=False)
-
-    out, _ = fwd(video)
-    out = np.asarray(out)
+    is_lvt = "lvt" in args.model
+    if is_lvt:
+        # FactorizedVideoCLIP returns (video_emb, text_emb, outputs); text_emb
+        # is None when text_token_ids is not passed.
+        @jax.jit
+        def fwd(x):
+            v_emb, _, _ = flax_model.apply(
+                state, inputs=x, text_token_ids=None, text_paddings=None,
+                train=False, normalize=True,
+            )
+            return v_emb
+        out = np.asarray(fwd(video))
+    else:
+        @jax.jit
+        def fwd(x):
+            return flax_model.apply(state, x, train=False)
+        emb, _ = fwd(video)
+        out = np.asarray(emb)
     print(f"final output: {out.shape} dtype={out.dtype}")
 
     save_kwargs = {"input": video, "output": out}
 
-    if args.save_intermediates:
+    if args.save_intermediates and is_lvt:
+        print("note: --save-intermediates is only supported for non-LvT models; skipping.")
+    elif args.save_intermediates:
         # Step-by-step reconstruction to capture intermediates. Numerical drift
         # vs the JIT'd forward is normal (~5e-4) — XLA fuses ops differently.
         P = cfg["patch_size"]

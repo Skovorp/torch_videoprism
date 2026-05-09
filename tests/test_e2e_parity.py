@@ -53,6 +53,22 @@ VARIANTS = {
         npz_env="VIDEOPRISM_NPZ_LARGE",
         fixture_default=os.path.join(os.path.dirname(__file__), "fixtures", "v1_large.npz"),
     ),
+    "lvt_base": VariantSpec(
+        model_name="videoprism_lvt_public_v1_base",
+        expected_params=(137_900_000, 138_100_000),
+        expected_output=(768,),       # video-only: single L2-normed embedding
+        fixture_env="VIDEOPRISM_FIXTURE_LVT_BASE",
+        npz_env="VIDEOPRISM_NPZ_LVT_BASE",
+        fixture_default=os.path.join(os.path.dirname(__file__), "fixtures", "lvt_v1_base.npz"),
+    ),
+    "lvt_large": VariantSpec(
+        model_name="videoprism_lvt_public_v1_large",
+        expected_params=(395_900_000, 396_100_000),
+        expected_output=(1024,),
+        fixture_env="VIDEOPRISM_FIXTURE_LVT_LARGE",
+        npz_env="VIDEOPRISM_NPZ_LVT_LARGE",
+        fixture_default=os.path.join(os.path.dirname(__file__), "fixtures", "lvt_v1_large.npz"),
+    ),
 }
 
 

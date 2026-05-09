@@ -64,10 +64,42 @@ VIDEOPRISM_V1_LARGE_CONFIG = dict(
     atten_logit_cap=50.0,
 )
 
+VIDEOPRISM_LVT_V1_BASE_CONFIG = dict(
+    # Vision branch matches videoprism_v1_base.
+    patch_size=18,
+    pos_emb_shape=(16, 16, 16),
+    model_dim=768,
+    num_spatial_layers=12,
+    num_temporal_layers=4,
+    num_heads=12,
+    mlp_dim=3072,
+    atten_logit_cap=50.0,
+    # LvT-specific (video-only port; we ignore the text branch).
+    num_auxiliary_layers=2,
+    pooler_hidden_dim=3072,  # = model_dim * 4
+)
+
+VIDEOPRISM_LVT_V1_LARGE_CONFIG = dict(
+    patch_size=18,
+    pos_emb_shape=(8, 16, 16),
+    model_dim=1024,
+    num_spatial_layers=24,
+    num_temporal_layers=4,
+    num_heads=16,
+    mlp_dim=4096,
+    atten_logit_cap=50.0,
+    num_auxiliary_layers=2,
+    pooler_hidden_dim=4096,
+)
+
 CONFIGS = {
-    "videoprism_public_v1_base": VIDEOPRISM_V1_BASE_CONFIG,
-    "videoprism_public_v1_large": VIDEOPRISM_V1_LARGE_CONFIG,
+    "videoprism_public_v1_base":     VIDEOPRISM_V1_BASE_CONFIG,
+    "videoprism_public_v1_large":    VIDEOPRISM_V1_LARGE_CONFIG,
+    "videoprism_lvt_public_v1_base": VIDEOPRISM_LVT_V1_BASE_CONFIG,
+    "videoprism_lvt_public_v1_large": VIDEOPRISM_LVT_V1_LARGE_CONFIG,
 }
+
+LVT_CONFIGS = {"videoprism_lvt_public_v1_base", "videoprism_lvt_public_v1_large"}
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +382,171 @@ class FactorizedEncoder(nn.Module):
         return x
 
 
+# ---------------------------------------------------------------------------
+# LvT video branch (cross-modal models, video side only)
+# ---------------------------------------------------------------------------
+
+
+class PerDimScale(nn.Module):
+    """Per-dimension scaling matching `layers.PerDimScale`.
+
+    Computes `scale = (1.0 / softplus(0)) / sqrt(D) * softplus(per_dim_scale)`
+    and multiplies the input by it elementwise on the last dim. With
+    per_dim_scale init to zero this equals the standard 1/sqrt(D) scaling, but
+    becomes per-dimension after training.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.per_dim_scale = nn.Parameter(torch.zeros(dim))
+        # 1.0 / softplus(0) = 1 / log(2) = 1.442695041
+        self.register_buffer("_const_scale",
+                             torch.tensor(1.442695041 / math.sqrt(dim), dtype=torch.float32),
+                             persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * (self._const_scale * F.softplus(self.per_dim_scale))
+
+
+class AttenTokenPooler(nn.Module):
+    """Cross-attention token pooler matching `layers.AttenTokenPoolingLayer`.
+
+    Has a learnable `pooling_attention_query` of shape (num_queries, model_dim)
+    that attends over the input tokens. Uses `PerDimScale` to scale the query
+    (matching `internal_enable_per_dim_scale=True` in the upstream pooler — the
+    only place in this port where PerDimScale is on, the main encoder uses
+    plain 1/sqrt(d_per_head)).
+    """
+    def __init__(self, model_dim: int, hidden_dim: int, num_heads: int, num_queries: int = 1):
+        super().__init__()
+        assert hidden_dim % num_heads == 0, (hidden_dim, num_heads)
+        self.model_dim = model_dim
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.dim_per_head = hidden_dim // num_heads
+        self.num_queries = num_queries
+
+        # Learnable pool query.
+        self.pooling_attention_query = nn.Parameter(torch.zeros(num_queries, model_dim))
+
+        # Cross-attention projections. Q maps from `model_dim` to `hidden_dim`;
+        # K, V map from input token dim (also `model_dim`) to `hidden_dim`;
+        # post maps back from `hidden_dim` to `model_dim`.
+        self.query = nn.Linear(model_dim, hidden_dim, bias=True)
+        self.key = nn.Linear(model_dim, hidden_dim, bias=True)
+        self.value = nn.Linear(model_dim, hidden_dim, bias=True)
+        self.post = nn.Linear(hidden_dim, model_dim, bias=True)
+        self.per_dim_scale = PerDimScale(self.dim_per_head)
+        self.layer_norm = nn.LayerNorm(model_dim, eps=1e-6)
+
+    def _split(self, x: torch.Tensor) -> torch.Tensor:
+        # (B, T, hidden) -> (B, T, num_heads, dim_per_head)
+        b, t, _ = x.shape
+        return x.view(b, t, self.num_heads, self.dim_per_head)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        b = tokens.shape[0]
+        # Tile the learnable query across batch.
+        q_in = self.pooling_attention_query.unsqueeze(0).expand(b, -1, -1)  # (B, num_queries, D)
+        q = self._split(self.query(q_in))                                   # (B, Q, N, H)
+        k = self._split(self.key(tokens))                                   # (B, T, N, H)
+        v = self._split(self.value(tokens))                                 # (B, T, N, H)
+
+        q = self.per_dim_scale(q)  # internal_enable_per_dim_scale=True in JAX
+        logits = torch.einsum("bqnh,btnh->bnqt", q, k)
+        # No logit cap on the pooler — JAX passes atten_logit_cap=0 by default
+        # and FactorizedVideoCLIP doesn't override it for the pooler.
+        probs = F.softmax(logits.float(), dim=-1).to(v.dtype)
+        encoded = torch.einsum("bnqt,btnh->bqnh", probs, v)                 # (B, Q, N, H)
+        encoded = encoded.reshape(b, self.num_queries, self.hidden_dim)
+        out = self.post(encoded)                                            # (B, Q, model_dim)
+        out = self.layer_norm(out)
+        return out
+
+
+@dataclass
+class FactorizedVideoEncoderConfig:
+    """LvT vision-only config — extends FactorizedEncoderConfig with pooler bits."""
+    patch_size: int = 18
+    pos_emb_shape: tuple = (16, 16, 16)
+    model_dim: int = 768
+    num_spatial_layers: int = 12
+    num_temporal_layers: int = 4
+    num_heads: int = 12
+    mlp_dim: int = 3072
+    atten_logit_cap: float = 50.0
+    num_auxiliary_layers: int = 2
+    pooler_hidden_dim: int = 3072
+    pooler_num_queries: int = 1
+
+
+class FactorizedVideoEncoder(nn.Module):
+    """Vision-only port of `encoders.FactorizedVideoCLIP`.
+
+    Pipeline:
+        FactorizedEncoder           -> (B, T*N, D)
+        auxiliary_encoder (2-layer) -> (B, T*N, D)
+        AttenTokenPooler            -> (B, num_queries=1, D)
+        squeeze axis 1              -> (B, D)
+        L2 normalize on last axis   -> (B, D)
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        cfg = FactorizedVideoEncoderConfig(**kwargs)
+        self.config = cfg
+
+        # `vision_encoder` has the same internals as the v1 base/large port —
+        # we re-use FactorizedEncoder. The Flax checkpoint uses the same
+        # parameter naming under `vision_encoder/...` so the loader maps cleanly.
+        self.vision_encoder = FactorizedEncoder(
+            patch_size=cfg.patch_size,
+            pos_emb_shape=cfg.pos_emb_shape,
+            model_dim=cfg.model_dim,
+            num_spatial_layers=cfg.num_spatial_layers,
+            num_temporal_layers=cfg.num_temporal_layers,
+            num_heads=cfg.num_heads,
+            mlp_dim=cfg.mlp_dim,
+            atten_logit_cap=cfg.atten_logit_cap,
+        )
+        # Auxiliary encoder is a `VisionTransformer`, which in this port maps
+        # to a TransformerStack with no final LayerNorm (matches JAX).
+        self.auxiliary_encoder = TransformerStack(
+            num_layers=cfg.num_auxiliary_layers,
+            dim=cfg.model_dim,
+            num_heads=cfg.num_heads,
+            mlp_dim=cfg.mlp_dim,
+            atten_logit_cap=cfg.atten_logit_cap,
+        )
+        self.contrastive_vision_pooler = AttenTokenPooler(
+            model_dim=cfg.model_dim,
+            hidden_dim=cfg.pooler_hidden_dim,
+            num_heads=cfg.num_heads,
+            num_queries=cfg.pooler_num_queries,
+        )
+
+    @property
+    def hidden_dim(self) -> int:
+        return self.config.model_dim
+
+    def forward(self, x: torch.Tensor, normalize: bool = True) -> torch.Tensor:
+        """Returns video embeddings of shape (B, model_dim) — L2-normalized by default."""
+        feats = self.vision_encoder(x)             # (B, T*N, D)
+        feats = self.auxiliary_encoder(feats)      # (B, T*N, D)
+        pooled = self.contrastive_vision_pooler(feats)  # (B, Q=1, D)
+        out = pooled.squeeze(-2)                    # (B, D)
+        if normalize:
+            # Match `_l2_normalize` in JAX: norm computed in fp32 for stability.
+            orig_dtype = out.dtype
+            out_f = out.float()
+            out = (out_f / (out_f.norm(dim=-1, keepdim=True) + 1e-12)).to(orig_dtype)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Factories
+# ---------------------------------------------------------------------------
+
+
 def build_videoprism_v1_base() -> FactorizedEncoder:
     """Builds a fresh FactorizedEncoder with the v1 base config (random init)."""
     return FactorizedEncoder(**VIDEOPRISM_V1_BASE_CONFIG)
@@ -360,13 +557,25 @@ def build_videoprism_v1_large() -> FactorizedEncoder:
     return FactorizedEncoder(**VIDEOPRISM_V1_LARGE_CONFIG)
 
 
-def build_videoprism(model_name: str) -> FactorizedEncoder:
-    """Generic factory: build a FactorizedEncoder by VideoPrism model name.
+def build_videoprism_lvt_v1_base() -> FactorizedVideoEncoder:
+    """Vision-only port of the LvT v1 base model (~138M params)."""
+    return FactorizedVideoEncoder(**VIDEOPRISM_LVT_V1_BASE_CONFIG)
 
-    Args:
-      model_name: one of `CONFIGS` (e.g. 'videoprism_public_v1_base',
-        'videoprism_public_v1_large').
+
+def build_videoprism_lvt_v1_large() -> FactorizedVideoEncoder:
+    """Vision-only port of the LvT v1 large model (~395M params)."""
+    return FactorizedVideoEncoder(**VIDEOPRISM_LVT_V1_LARGE_CONFIG)
+
+
+def build_videoprism(model_name: str) -> nn.Module:
+    """Generic factory: builds a fresh model (random init) for any name in `CONFIGS`.
+
+    Returns a `FactorizedVideoEncoder` for `videoprism_lvt_public_v1_*` names
+    (vision-only port, output is a single (B, D) embedding); a `FactorizedEncoder`
+    for `videoprism_public_v1_*` (token output of shape (B, T*N, D)).
     """
     if model_name not in CONFIGS:
         raise ValueError(f"unknown VideoPrism model {model_name!r}. Known: {sorted(CONFIGS)}")
+    if model_name in LVT_CONFIGS:
+        return FactorizedVideoEncoder(**CONFIGS[model_name])
     return FactorizedEncoder(**CONFIGS[model_name])
