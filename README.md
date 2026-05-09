@@ -103,13 +103,14 @@ Each transformer block is pre-LN with multi-head self-attention; the attention a
 
 ## Test results
 
-26 tests pass in ~80s on CPU (5090 box, torch 2.8.0+cu128). Numbers below are from the same run, comparing PyTorch outputs against the JAX golden checkpoint loaded into both stacks on identical inputs.
+48 tests pass in ~100 s on CPU. Numbers below are from the same run, comparing PyTorch outputs against the JAX golden checkpoint loaded into both stacks on identical inputs.
 
 | Test suite | Tests | What it covers |
 |---|---:|---|
-| `tests/test_components.py` | 9 | PyTorch unit tests (no checkpoint, no JAX): patchify ordering, MLP residual, attention math invariants, transformer-block identity, full encoder shape / 114M param total / determinism. |
+| `tests/test_components.py` | 9  | PyTorch unit tests (no checkpoint, no JAX): patchify ordering, MLP residual, attention math invariants, transformer-block identity, full encoder shape / 114 M param total / determinism. |
 | `tests/test_e2e_parity.py` | 12 | Final-output parity per variant (param count, output shape, cosine sim, abs error). Parameterized across all 4 variants. |
-| `tests/test_deep_parity.py` | 5 | Multi-batch + multi-seed + real-video parity, **intermediate parity** (post-`spatial_ln` and post-`temporal_ln`), gradient flow. v1_base only. |
+| `tests/test_deep_parity.py` | 5  | Multi-batch + multi-seed + real-video parity, **intermediate parity** (post-`spatial_ln` and post-`temporal_ln`), gradient flow. v1_base only. |
+| `tests/test_pe_parity.py`  | 22 | **Direct & full-model parity** for the spatial (`_interpolate_2d_pos`) and temporal (`_interpolate_1d_pos`) pos-emb interpolation paths. Covers source-vs-target combinations for downsampling, identity (no-op), and upsampling — both at the helper level and through a full forward pass against JAX. |
 
 Per-variant final-output parity vs JAX (B=2 random seeds, fp32 throughout):
 
@@ -126,23 +127,68 @@ The order-of-magnitude jump in absolute error for the LvT variants is because th
 
 ## Inference benchmark
 
-CPU vs GPU, `B=1, T=native, 288²`, mean of 5–10 timed iterations after warmup. PyTorch 2.8.0+cu128 / JAX 0.10.0 / Flax 0.12.7. RTX 5090 (sm_120).
+RTX 5090 (sm_120), torch 2.8.0+cu128, `set_float32_matmul_precision('high')` (i.e. TF32 enabled). All numbers are mean ± stdev over 10 timed iterations after warmup, native frame count per variant (`T=16` for base/lvt-base, `T=8` for large/lvt-large), `288×288` input.
 
-| Variant | JAX (CPU XLA) | PyTorch (CPU eager) | PyTorch (CPU `torch.compile`) | PyTorch (GPU eager) |
+| Variant | B | fp32 eager | fp32 `torch.compile` | fp16 eager |
 |---|---:|---:|---:|---:|
-| `v1_base`       | 1.52 s | 2.60 s | **1.42 s** | **29 ms** |
-| `v1_large`      | —      | —      | —          | **35 ms** |
-| `lvt_v1_base`   | —      | —      | —          | **45 ms** |
-| `lvt_v1_large`  | —      | —      | —          | **42 ms** |
+| `v1_base`       | 1 |  17.7 ms |  15.3 ms |   **8.9 ms** |
+| `v1_base`       | 4 |  67.9 ms |  54.6 ms |  40.1 ms |
+| `v1_base`       | 8 | 136.2 ms | 111.6 ms |  80.8 ms |
+| `v1_large`      | 1 |  22.6 ms |  20.4 ms |  13.5 ms |
+| `v1_large`      | 4 |  97.0 ms |  83.4 ms |  54.3 ms |
+| `v1_large`      | 8 | 193.8 ms | 169.6 ms | 113.3 ms |
+| `lvt_v1_base`   | 1 |  30.8 ms |  22.0 ms |  19.9 ms |
+| `lvt_v1_base`   | 4 | 119.0 ms |  80.0 ms |  84.0 ms |
+| `lvt_v1_base`   | 8 | 237.7 ms | 162.1 ms | 168.3 ms |
+| `lvt_v1_large`  | 1 |  28.1 ms |  23.8 ms |  17.9 ms |
+| `lvt_v1_large`  | 4 | 118.4 ms |  96.1 ms |  72.1 ms |
+| `lvt_v1_large`  | 8 | 235.9 ms | 194.9 ms | 146.1 ms |
 
-`torch.compile` makes PyTorch ~7% faster than JAX-XLA on CPU. On GPU (5090, eager), `v1_base` runs at ~34 fps for 16-frame clips end-to-end.
+Take-aways:
+- **`torch.compile`** gives 15–30 % over fp32 eager on 5090 — usually worth it for batch-size ≥ 4.
+- **fp16 eager** is ~1.5–2× faster than fp32 eager. Numerical parity with the JAX reference is preserved at fp16 (cosine similarity stays at 1.000000 in our checks).
+- Throughput at `B=8, fp16, v1_base`: ~99 clips/s ≈ 1.6 K frames/s.
+
+For the CPU-only path (no 5090), see `tests/bench_inference.py` — JAX-XLA and PyTorch+`torch.compile` are within ~7 % of each other on `v1_base`.
+
+## Preprocessing
+
+If you don't want the HF processor, the preprocessing pipeline is short and explicit. The model expects:
+
+- **Shape**: `(B, T, H, W, C)` — channels **last** (matching the JAX API), `H == W`.
+- **Frame count**: `T = 16` for `v1_base` / `lvt_v1_base`, `T = 8` for `v1_large` / `lvt_v1_large`. Other values are accepted via 1D linear interpolation of the temporal pos-emb (parity-tested at `T ∈ {8, 12, 24}` for `v1_base`).
+- **Spatial size**: native `288×288`. Other sizes (multiples of `patch_size=18`) are accepted via 2D bilinear interpolation of the spatial pos-emb (parity-tested at `144 / 216 / 432 / 576`).
+- **Pixel range**: float32 in `[0, 1]`. **No ImageNet mean/std normalization** — just divide raw `uint8` frames by 255.
+
+Minimal framework-agnostic preprocessing (~15 lines):
+
+```python
+import numpy as np
+import cv2
+
+def preprocess_video(uint8_frames, num_frames=16, image_size=288):
+    """Convert a (T_input, H, W, 3) uint8 video to (1, num_frames, image_size, image_size, 3) float32 in [0, 1].
+
+    `uint8_frames` is the decoded video — e.g. `decord.VideoReader(path).get_batch(...).asnumpy()`
+    or `np.stack([np.array(pil_img) for pil_img in frames])`.
+    """
+    T_in = uint8_frames.shape[0]
+    idx = np.linspace(0, max(T_in - 1, 0), num=num_frames).astype(int)   # uniform sampling
+    sampled = uint8_frames[idx]                                          # (num_frames, H, W, 3)
+    resized = np.stack([
+        cv2.resize(f, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+        for f in sampled
+    ])                                                                    # bilinear resize
+    return (resized.astype(np.float32) / 255.0)[None]                     # add batch axis, [0,1]
+```
+
+That's it — no per-channel normalization, no center crop, no temporal jitter. Feed the result to `model(...)` directly.
 
 ## Limitations
 
-- **Spatial position-embedding interpolation is not implemented.** All current variants use 16×16 spatial patches at 288 px, which already matches the trained pos-emb. Calling the model with a non-native spatial resolution will assert.
-- **Temporal pos-emb interpolation works** (linear, matching JAX's `bilinear` for 1D), but is not exercised in the parity tests — running at non-native frame counts is on a believed-equivalent path.
-- **No upstream `videoprism_v1_giant` support** — Google has not released those weights.
-- **LvT text encoder not ported** — by design.
+- **No upstream `videoprism_v1_giant` support** — Google has not released those weights publicly.
+- **LvT text encoder not ported** — by design (this is a vision-only port of the LvT models).
+- **Patch size is fixed at 18** — input height & width must be multiples of 18.
 
 ## Regenerating the parity fixtures
 
@@ -160,6 +206,9 @@ python tests/extract_fixture_jax.py --out tests/fixtures/lvt_v1_large.npz  --mod
 # `tests/test_deep_parity.py` needs a separate 3-batch fixture for v1_base.
 python tests/extract_fixture_jax.py --out tests/fixtures/v1_base_multi.npz --model videoprism_public_v1_base       --seeds 0,1,2 --save-intermediates
 
+# `tests/test_pe_parity.py` needs its own fixture covering many (h_p, w_p) and T values.
+python tests/extract_pe_fixture_jax.py --out tests/fixtures/pe.npz
+
 pytest tests/
 ```
 
@@ -173,6 +222,7 @@ Each test fixture path can be overridden via env var (defaults are
 | `VIDEOPRISM_FIXTURE_LVT_BASE`   | `test_e2e_parity.py` (lvt base)        | `tests/fixtures/lvt_v1_base.npz`   |
 | `VIDEOPRISM_FIXTURE_LVT_LARGE`  | `test_e2e_parity.py` (lvt large)       | `tests/fixtures/lvt_v1_large.npz`  |
 | `VIDEOPRISM_MULTI_FIXTURE`      | `test_deep_parity.py`                  | `tests/fixtures/v1_base_multi.npz` |
+| `VIDEOPRISM_PE_FIXTURE`         | `test_pe_parity.py`                    | `tests/fixtures/pe.npz`            |
 | `VIDEOPRISM_NPZ_<VARIANT>`      | optional override of the Flax `.npz` checkpoint path (otherwise pulled from HF) |
 
 ## Layout
@@ -191,8 +241,11 @@ tests/
 ├── test_components.py          # unit tests (no checkpoint, no JAX)
 ├── test_e2e_parity.py          # final-output parity, all 4 variants
 ├── test_deep_parity.py         # intermediates, multi-batch, gradient flow (v1_base)
-├── extract_fixture_jax.py      # regenerates JAX fixtures
-└── bench_inference.py          # JAX vs PyTorch (eager + compile) timings
+├── test_pe_parity.py           # spatial + temporal PE interpolation parity vs JAX
+├── extract_fixture_jax.py      # regenerates the e2e/deep JAX fixtures
+├── extract_pe_fixture_jax.py   # regenerates the PE-interpolation JAX fixture
+├── bench_inference.py          # CPU benchmark (JAX vs PyTorch eager / compile)
+└── bench_inference_full.py     # GPU benchmark (4 variants × batch × dtype/compile)
 hubconf.py                      # torch.hub entry points
 pyproject.toml                  # extras: [test], [hf], [parity]
 LICENSE                         # Apache-2.0

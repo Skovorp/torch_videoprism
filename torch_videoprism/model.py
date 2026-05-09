@@ -230,6 +230,61 @@ class TransformerStack(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _interpolate_2d_pos(
+    emb: torch.Tensor, source_hw: tuple[int, int], target_hw: tuple[int, int]
+) -> torch.Tensor:
+    """Bilinear-interpolate a flattened 2D pos embedding.
+
+    Mirrors `encoders._interpolate_emb_2d` from upstream, which uses
+    `jax.image.resize(method='bilinear')`. JAX's `jax.image.resize` antialiases
+    on downsampling by default; we pass `antialias=True` so PyTorch behaves the
+    same. The antialias kwarg is a no-op for upsampling.
+
+    Both stacks use the half-pixel-center convention (`align_corners=False`).
+
+    Args:
+      emb:        (H1*W1, D) flattened source embedding.
+      source_hw:  (H1, W1).
+      target_hw:  (H2, W2).
+    Returns:
+      (H2*W2, D) flattened target embedding.
+    """
+    if source_hw == target_hw:
+        return emb
+    h1, w1 = source_hw
+    h2, w2 = target_hw
+    n_src, d = emb.shape
+    assert n_src == h1 * w1, (n_src, h1, w1)
+    # (H1*W1, D) -> (1, D, H1, W1)
+    grid = emb.transpose(0, 1).reshape(1, d, h1, w1)
+    grid = F.interpolate(
+        grid, size=(h2, w2), mode="bilinear", align_corners=False, antialias=True
+    )
+    return grid.reshape(d, h2 * w2).transpose(0, 1).contiguous()
+
+
+def _interpolate_1d_pos(emb: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Linear-interpolate a 1D pos embedding from (T1, D) -> (T2, D).
+
+    Mirrors `encoders._interpolate_emb_1d` — which calls
+    `jax.image.resize(method='bilinear')` on a 2D `(T, D)` array, asking for
+    `(target_len, D)`. PyTorch's `F.interpolate(mode='linear')` doesn't
+    support `antialias=True`, so we route through `mode='bilinear'` with a
+    singleton channel dim: feed `(1, 1, T, D)` and resize to `(target_len, D)`.
+    The D-axis is resized to itself (identity); antialiasing only kicks in
+    on the T-axis when downsampling, exactly matching JAX.
+    """
+    t_src, d = emb.shape
+    if t_src == target_len:
+        return emb
+    grid = emb.unsqueeze(0).unsqueeze(0)  # (1, 1, T1, D)
+    grid = F.interpolate(
+        grid, size=(target_len, d), mode="bilinear",
+        align_corners=False, antialias=True,
+    )
+    return grid.squeeze(0).squeeze(0).contiguous()
+
+
 def patchify_image(x: torch.Tensor, patch_size: int) -> torch.Tensor:
     """`encoders._image_to_patch` ported to PyTorch.
 
@@ -342,10 +397,15 @@ class FactorizedEncoder(nn.Module):
 
         # Project + add spatial position embedding.
         x = self.patch_projection(x)                       # (B*T, N, D)
-        spatial_pos = self.spatial_pos_emb                 # (N, D)
-        # NOTE: The reference config has pos_emb_shape (16,16,16) and patch_size 18,
-        # so spatial_pos already matches (h//P)*(w//P)=256. We don't support 2D
-        # interpolation in the port — assert instead.
+        num_row_patches = h // cfg.patch_size
+        num_col_patches = w // cfg.patch_size
+        native_hp, native_wp = cfg.pos_emb_shape[1], cfg.pos_emb_shape[2]
+        spatial_pos = self.spatial_pos_emb                 # (native_hp * native_wp, D)
+        if (native_hp, native_wp) != (num_row_patches, num_col_patches):
+            # Bilinear 2D interpolation, mirroring JAX `_interpolate_emb_2d`.
+            spatial_pos = _interpolate_2d_pos(
+                spatial_pos, (native_hp, native_wp), (num_row_patches, num_col_patches),
+            )
         assert spatial_pos.shape[0] == x.shape[1], (
             f"spatial pos length {spatial_pos.shape[0]} != num patches {x.shape[1]}"
         )
@@ -360,15 +420,8 @@ class FactorizedEncoder(nn.Module):
         assert bt == b * t
         x = x.reshape(b, t, n, d).permute(0, 2, 1, 3).contiguous().reshape(b * n, t, d)
 
-        # Temporal pos. If T differs from the embedding's stored length,
-        # interpolate linearly — mirrors the JAX `_interpolate_emb_1d` path
-        # (jax.image.resize(method='bilinear') is just linear in 1D).
-        temporal_pos = self.temporal_pos_emb               # (T_native, D)
-        if temporal_pos.shape[0] != t:
-            # (T_native, D) -> (1, D, T_native) -> interpolate -> (1, D, T) -> (T, D)
-            tp = temporal_pos.t().unsqueeze(0)
-            tp = F.interpolate(tp, size=t, mode="linear", align_corners=False)
-            temporal_pos = tp.squeeze(0).t().contiguous()
+        # Temporal pos: linear interpolation if T differs from the trained length.
+        temporal_pos = _interpolate_1d_pos(self.temporal_pos_emb, t)
         x = x + temporal_pos.unsqueeze(0)
 
         # Temporal encoder + LN.
