@@ -117,7 +117,7 @@ def _copy_with_substitutions(src: Path, dst: Path, replacements: dict[str, str])
     dst.write_text(text)
 
 
-def _write_readme(out_dir: Path, model_name: str) -> None:
+def _write_readme(out_dir: Path, model_name: str, namespace: str = "sposiboh") -> None:
     is_lvt = model_name in LVT_CONFIGS
     upstream_repo, upstream_file = HF_CHECKPOINTS[model_name]
     auto_class = "AutoModel"
@@ -147,8 +147,8 @@ def _write_readme(out_dir: Path, model_name: str) -> None:
         ```python
         from transformers import AutoModel, AutoProcessor
 
-        model = AutoModel.from_pretrained("Skovorp/{HF_REPO_NAMES[model_name]}", trust_remote_code=True)
-        processor = AutoProcessor.from_pretrained("Skovorp/{HF_REPO_NAMES[model_name]}", trust_remote_code=True)
+        model = AutoModel.from_pretrained("{namespace}/{HF_REPO_NAMES[model_name]}", trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained("{namespace}/{HF_REPO_NAMES[model_name]}", trust_remote_code=True)
 
         # Process a video file (or a list of frames / numpy / torch tensor):
         inputs = processor(videos="path/to/video.mp4", return_tensors="pt")
@@ -177,8 +177,19 @@ def _write_readme(out_dir: Path, model_name: str) -> None:
     (out_dir / "README.md").write_text(body)
 
 
-def build_hf_repo(model_name: str, out_dir: str | Path, *, weights: bool = True) -> Path:
-    """Materialize a HF-loadable repo dir for one VideoPrism variant."""
+def build_hf_repo(
+    model_name: str,
+    out_dir: str | Path,
+    *,
+    weights: bool = True,
+    namespace: str = "sposiboh",
+) -> Path:
+    """Materialize a HF-loadable repo dir for one VideoPrism variant.
+
+    `namespace` is the HF user/org the README's example commands point to
+    (e.g. `sposiboh/<repo>`). Doesn't change anything else about the repo
+    contents — just the documentation.
+    """
     if model_name not in CONFIGS:
         raise ValueError(f"Unknown model name: {model_name!r}")
 
@@ -232,6 +243,6 @@ def build_hf_repo(model_name: str, out_dir: str | Path, *, weights: bool = True)
         replacements={},  # processing has no torch_videoprism imports
     )
     _build_self_contained_modeling(out_dir / "modeling_videoprism.py")
-    _write_readme(out_dir, model_name)
+    _write_readme(out_dir, model_name, namespace=namespace)
 
     return out_dir

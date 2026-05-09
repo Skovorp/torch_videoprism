@@ -34,8 +34,8 @@ Three loading paths — pick whichever you prefer.
 import torch
 from transformers import AutoModel, AutoProcessor
 
-model = AutoModel.from_pretrained("Skovorp/videoprism-base-f16r288-pt", trust_remote_code=True).eval()
-processor = AutoProcessor.from_pretrained("Skovorp/videoprism-base-f16r288-pt", trust_remote_code=True)
+model = AutoModel.from_pretrained("sposiboh/videoprism-base-f16r288-pt", trust_remote_code=True).eval()
+processor = AutoProcessor.from_pretrained("sposiboh/videoprism-base-f16r288-pt", trust_remote_code=True)
 
 # Accepts: a video file path, a list of PIL Images, np.array (T, H, W, 3) of uint8 or float,
 # or a torch.Tensor of one of those shapes. Frames are sampled uniformly to the model's
@@ -48,7 +48,11 @@ embedding = out.last_hidden_state          # (1, 4096, 768) for base
 # For LvT variants, the attribute is `out.video_embeds` and the shape is (B, model_dim).
 ```
 
-Available HF repos: `videoprism-base-f16r288-pt`, `videoprism-large-f8r288-pt`, `videoprism-lvt-base-f16r288-pt`, `videoprism-lvt-large-f8r288-pt`.
+All 4 variants on HF (collection: [sposiboh/videoprism-pytorch-port](https://huggingface.co/collections/sposiboh/videoprism-pytorch-port-69ffbf1d5fa09a808dcfa507)):
+[`sposiboh/videoprism-base-f16r288-pt`](https://huggingface.co/sposiboh/videoprism-base-f16r288-pt) ·
+[`sposiboh/videoprism-large-f8r288-pt`](https://huggingface.co/sposiboh/videoprism-large-f8r288-pt) ·
+[`sposiboh/videoprism-lvt-base-f16r288-pt`](https://huggingface.co/sposiboh/videoprism-lvt-base-f16r288-pt) ·
+[`sposiboh/videoprism-lvt-large-f8r288-pt`](https://huggingface.co/sposiboh/videoprism-lvt-large-f8r288-pt).
 
 **`torch.hub.load`** (no `pip install` required):
 
