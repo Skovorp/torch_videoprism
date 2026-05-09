@@ -125,31 +125,32 @@ The order-of-magnitude jump in absolute error for the LvT variants is because th
 
 `test_deep_parity.py` additionally compares post-`spatial_ln` (after 12 spatial transformer layers) and post-`temporal_ln` (after 4 temporal transformer layers) intermediates for v1_base — both come back at cosine sim = 1.000000 with mean abs error at the fp32 noise floor.
 
-## Inference benchmark
+## Inference benchmark — JAX vs PyTorch on the same GPU
 
-RTX 5090 (sm_120), torch 2.8.0+cu128, `set_float32_matmul_precision('high')` (i.e. TF32 enabled). All numbers are mean ± stdev over 10 timed iterations after warmup, native frame count per variant (`T=16` for base/lvt-base, `T=8` for large/lvt-large), `288×288` input.
+RTX 5090 (sm_120), torch 2.8.0+cu128, JAX 0.10.0 / Flax 0.12.7, fp32 throughout. Each side runs in its own subprocess so it gets the full GPU; both stacks are JIT-compiled (`jax.jit` and `torch.compile(dynamic=False)` over the whole model). Mean ± stdev of 8 timed iterations after warmup. Reproduce with `python tests/bench_vs_jax.py --side both`.
 
-| Variant | B | fp32 eager | fp32 `torch.compile` | fp16 eager |
-|---|---:|---:|---:|---:|
-| `v1_base`       | 1 |  17.7 ms |  15.3 ms |   **8.9 ms** |
-| `v1_base`       | 4 |  67.9 ms |  54.6 ms |  40.1 ms |
-| `v1_base`       | 8 | 136.2 ms | 111.6 ms |  80.8 ms |
-| `v1_large`      | 1 |  22.6 ms |  20.4 ms |  13.5 ms |
-| `v1_large`      | 4 |  97.0 ms |  83.4 ms |  54.3 ms |
-| `v1_large`      | 8 | 193.8 ms | 169.6 ms | 113.3 ms |
-| `lvt_v1_base`   | 1 |  30.8 ms |  22.0 ms |  19.9 ms |
-| `lvt_v1_base`   | 4 | 119.0 ms |  80.0 ms |  84.0 ms |
-| `lvt_v1_base`   | 8 | 237.7 ms | 162.1 ms | 168.3 ms |
-| `lvt_v1_large`  | 1 |  28.1 ms |  23.8 ms |  17.9 ms |
-| `lvt_v1_large`  | 4 | 118.4 ms |  96.1 ms |  72.1 ms |
-| `lvt_v1_large`  | 8 | 235.9 ms | 194.9 ms | 146.1 ms |
+| variant | B | jax fwd | **torch fwd** | jax fwd+bwd | **torch fwd+bwd** |
+|---|---:|---:|---:|---:|---:|
+| `v1_base`       | 1 |  12.9 ms |   14.6 ms |  53.0 ms |  **45.4 ms** |
+| `v1_base`       | 4 |  53.8 ms |  **47.8 ms** | 211.8 ms | **149.1 ms** |
+| `v1_base`       | 8 | 112.0 ms |  **92.3 ms** | 430.4 ms | **285.9 ms** |
+| `v1_large`      | 1 |  19.4 ms |  **19.1 ms** |  77.5 ms |  **61.6 ms** |
+| `v1_large`      | 4 |  77.4 ms |  **74.4 ms** | 301.6 ms | **230.0 ms** |
+| `v1_large`      | 8 | 157.4 ms | **142.3 ms** | 604.8 ms | **453.7 ms** |
+| `lvt_v1_base`   | 1 |  19.3 ms |  **18.6 ms** |  79.1 ms |  **60.6 ms** |
+| `lvt_v1_base`   | 4 |  77.8 ms |  **60.4 ms** | 309.9 ms | **203.3 ms** |
+| `lvt_v1_base`   | 8 |  OOM     | **116.7 ms** |   OOM    | **398.5 ms** |
+| `lvt_v1_large`  | 1 |  22.5 ms |  **21.5 ms** |  90.5 ms |  **70.2 ms** |
+| `lvt_v1_large`  | 4 |  89.6 ms |  **83.2 ms** | 348.1 ms | **260.9 ms** |
+| `lvt_v1_large`  | 8 | **181.5 ms** |   OOM   | **693.2 ms** |   OOM    |
 
 Take-aways:
-- **`torch.compile`** gives 15–30 % over fp32 eager on 5090 — usually worth it for batch-size ≥ 4.
-- **fp16 eager** is ~1.5–2× faster than fp32 eager. Numerical parity with the JAX reference is preserved at fp16 (cosine similarity stays at 1.000000 in our checks).
-- Throughput at `B=8, fp16, v1_base`: ~99 clips/s ≈ 1.6 K frames/s.
+- **Forward**: PyTorch is flat-to-+29 % faster than JAX. Only B=1 v1_base is slightly slower (-13 %) where launch overhead dominates a 15 ms cell.
+- **Forward + backward**: PyTorch is +17–52 % faster than JAX across the board. Most of the win comes from the FlexAttention fused backward kernel.
+- **Why FlexAttention?** The attention math has a Primer-style logit cap (`50 · tanh(logits / 50)` before softmax) — vanilla `F.scaled_dot_product_attention` doesn't expose a hook for that. `flex_attention(score_mod=…)` does, and is fused via `torch.compile` to match JAX's XLA path.
+- **OOMs at B=8** (both directions) are memory-architecture differences, not perf bugs: JAX preallocates its slice up-front (so `lvt_v1_base` runs out before forward completes), PyTorch holds the full activation graph for backward (so `lvt_v1_large` runs out at the end). Both are real-world rough edges, not regressions.
 
-For the CPU-only path (no 5090), see `tests/bench_inference.py` — JAX-XLA and PyTorch+`torch.compile` are within ~7 % of each other on `v1_base`.
+For the CPU-only path (no 5090), see `tests/bench_inference.py` — JAX-XLA and PyTorch+`torch.compile` are within ~7 % on `v1_base`.
 
 ## Preprocessing
 
